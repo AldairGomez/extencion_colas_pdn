@@ -1,0 +1,25 @@
+{
+    "manifest_version": 3,
+    "name": "Sync MediWeb a Supabase",
+    "version": "1.0",
+    "description": "Captura pacientes y pendientes para el Sistema de Colas de la TV.",
+    "permissions": [
+        "activeTab",
+        "scripting"
+    ],
+    "host_permissions": [
+        "*://intranet.policlinicodivinonino.com.pe/*"
+    ],
+    "content_scripts": [
+        {
+            "matches": [
+                "*://intranet.policlinicodivinonino.com.pe/*/buscarpacientes.php*"
+            ],
+            "js": [
+                "content.js"
+            ],
+            "run_at": "document_idle",
+            "all_frames": true
+        }
+    ]
+}
