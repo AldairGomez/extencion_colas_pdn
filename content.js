@@ -38,6 +38,48 @@ let isSyncing = false;
 let monitorUI = null;
 let estadoAnterior = {}; // Memoria RAM de la última versión enviada a Supabase
 
+const TAB_ID = Math.random().toString(36).substring(2, 15);
+const LOCK_KEY = 'mediweb_sync_lock';
+
+// --- CONTROL DE PESTAÑA ÚNICA ---
+function soyPestanaMaestra() {
+    try {
+        const lockStr = localStorage.getItem(LOCK_KEY);
+        const lock = lockStr ? JSON.parse(lockStr) : { time: 0, id: '' };
+        const now = Date.now();
+        // Si el lock expiró (más de 6 segundos) o yo soy el dueño
+        if (now - lock.time > 6000 || lock.id === TAB_ID) {
+            localStorage.setItem(LOCK_KEY, JSON.stringify({ id: TAB_ID, time: now }));
+            return true;
+        }
+        return false;
+    } catch(e) {
+        return true; // En caso de error, asumir maestra para no bloquear
+    }
+}
+
+// --- VALIDACIÓN DE FECHA ACTUAL ---
+function esFechaActual() {
+    const params = new URLSearchParams(window.location.search);
+    const fechaInicio = params.get('fechainicio');
+    const fechaFinal = params.get('fechafinal');
+
+    const hoy = new Date();
+    const dia = String(hoy.getDate()).padStart(2, '0');
+    const mes = String(hoy.getMonth() + 1).padStart(2, '0');
+    const anio = hoy.getFullYear();
+    const fechaHoyStr = `${dia}-${mes}-${anio}`;
+
+    // Si la URL no tiene parámetros, asume que es el día actual.
+    if (!fechaInicio && !fechaFinal) return true;
+    
+    // Si tiene, debe coincidir exactamente con hoy.
+    if ((fechaInicio && fechaInicio !== fechaHoyStr) || (fechaFinal && fechaFinal !== fechaHoyStr)) {
+        return false;
+    }
+    return true;
+}
+
 // --- GESTIÓN DE CACHÉ CON CADUCIDAD (AMNESIA CONTROLADA) ---
 function obtenerCache() {
     return JSON.parse(sessionStorage.getItem('mediweb_cache_pacientes') || '{}');
@@ -145,52 +187,99 @@ function extraerDatosConIframe(url) {
     });
 }
 
-// --- LÓGICA PRINCIPAL (REFRESCO FANTASMA + SMART DIFF) ---
+// --- LÓGICA PRINCIPAL (REFRESCO FANTASMA MULTI-PÁGINA + SMART DIFF) ---
 async function cicloSincronizacion() {
     if (isSyncing) return;
     isSyncing = true;
+
+    if (!soyPestanaMaestra()) {
+        actualizarUI("⏸️ Pausado (Otra pestaña activa)", "#555555");
+        isSyncing = false;
+        setTimeout(cicloSincronizacion, 3000);
+        return;
+    }
+
+    if (!esFechaActual()) {
+        actualizarUI("⏸️ Pausado (Fecha pasada)", "#ff5555");
+        isSyncing = false;
+        setTimeout(cicloSincronizacion, 3000);
+        return;
+    }
 
     actualizarUI("Buscando cambios...", "#FFA500");
     const cache = obtenerCache();
 
     try {
-        // 1. REFRESCO FANTASMA
-        const responseWeb = await fetch(window.location.href, { cache: 'no-store' });
-        const htmlWeb = await responseWeb.text();
-        const docVirtual = new DOMParser().parseFromString(htmlWeb, 'text/html');
-        const filas = docVirtual.querySelectorAll('tr[onmouseover="rowOverEffect(this)"]');
+        // 1. OBTENER URLS DE TODAS LAS PÁGINAS (PAGINACIÓN)
+        const responsePrincipal = await fetch(window.location.href, { cache: 'no-store' });
+        if (!responsePrincipal.ok) throw new Error("Fallo de red al obtener página principal");
+        
+        const htmlPrincipal = await responsePrincipal.text();
+        const docPrincipal = new DOMParser().parseFromString(htmlPrincipal, 'text/html');
+        
+        // Validar que no estemos en una página de error o caída de servidor
+        if (!docPrincipal.querySelector('table')) {
+            throw new Error("Estructura HTML inválida o sesión expirada");
+        }
+
+        const urlsAParcear = new Set([window.location.href]);
+
+        // Extraer todos los enlaces de números (ignoramos 'Siguiente' / 'Anterior' porque no son números)
+        const enlacesPaginacion = docPrincipal.querySelectorAll('.FacetDataTD center a');
+        enlacesPaginacion.forEach(enlace => {
+            const textoEnlace = enlace.innerText.trim();
+            if (!isNaN(textoEnlace) && textoEnlace !== "") {
+                urlsAParcear.add(enlace.href);
+            }
+        });
 
         const pacientesAProcesar = [];
+        const idsProcesados = new Set(); // Evita pacientes repetidos si Mediweb duplica datos
 
-        for (const fila of filas) {
-            const celdas = fila.querySelectorAll('td');
-            if (celdas.length > 7) {
-                const nombreCompleto = celdas[6].innerText.trim();
-                const enlaceHistoria = fila.querySelector('a[href*="idseccion=21"]');
+        // 2. REFRESCO FANTASMA MULTI-PÁGINA
+        for (const url of urlsAParcear) {
+            let htmlPagina = htmlPrincipal;
+            let docVirtual = docPrincipal;
 
-                if (enlaceHistoria) {
-                    const linkRelativo = enlaceHistoria.getAttribute('href');
-                    const urlObj = new URL(linkRelativo, window.location.href);
-                    const idInterno = parseInt(urlObj.searchParams.get('idpaciente'));
+            if (url !== window.location.href) {
+                const response = await fetch(url, { cache: 'no-store' });
+                if (!response.ok) continue; // Si falla solo una pagina, continuamos con las demás
+                htmlPagina = await response.text();
+                docVirtual = new DOMParser().parseFromString(htmlPagina, 'text/html');
+            }
 
-                    const consultoriosPendientes = new Set();
-                    const celdasEspecialidades = Array.from(celdas).slice(8);
+            const filas = docVirtual.querySelectorAll('tr[onmouseover="rowOverEffect(this)"]');
+            for (const fila of filas) {
+                const celdas = fila.querySelectorAll('td');
+                if (celdas.length > 7) {
+                    const nombreCompleto = celdas[6].innerText.trim();
+                    const enlaceHistoria = fila.querySelector('a[href*="idseccion=21"]');
 
-                    celdasEspecialidades.forEach(celda => {
-                        const img = celda.querySelector('img');
-                        if (img && celda.getAttribute('bgcolor') !== '#00CC00') {
-                            const asig = MAPA_CONSULTORIOS[img.getAttribute('title')];
-                            if (asig) consultoriosPendientes.add(asig);
+                    if (enlaceHistoria) {
+                        const linkRelativo = enlaceHistoria.getAttribute('href');
+                        const urlObj = new URL(linkRelativo, window.location.href);
+                        const idInterno = parseInt(urlObj.searchParams.get('idpaciente'));
+
+                        if (idInterno && !idsProcesados.has(idInterno)) {
+                            idsProcesados.add(idInterno);
+                            const consultoriosPendientes = new Set();
+                            const celdasEspecialidades = Array.from(celdas).slice(8);
+
+                            celdasEspecialidades.forEach(celda => {
+                                const img = celda.querySelector('img');
+                                if (img) {
+                                    const asig = MAPA_CONSULTORIOS[img.getAttribute('title')];
+                                    if (asig) consultoriosPendientes.add(asig);
+                                }
+                            });
+
+                            pacientesAProcesar.push({
+                                id_mediweb: idInterno,
+                                nombre: nombreCompleto,
+                                url_extraccion: urlObj.href,
+                                pendientes: Array.from(consultoriosPendientes)
+                            });
                         }
-                    });
-
-                    if (idInterno) {
-                        pacientesAProcesar.push({
-                            id_mediweb: idInterno,
-                            nombre: nombreCompleto,
-                            url_extraccion: urlObj.href,
-                            pendientes: Array.from(consultoriosPendientes)
-                        });
                     }
                 }
             }
@@ -198,19 +287,17 @@ async function cicloSincronizacion() {
 
         const idsEnPantallaFantasma = pacientesAProcesar.map(p => p.id_mediweb);
 
-        // 2. EXTRACCIÓN CON CADUCIDAD (Amnesia cada 60 seg)
+        // 3. EXTRACCIÓN CON CADUCIDAD (Amnesia cada 15 seg)
         const promesasExtraccion = pacientesAProcesar.map(async (paciente, index) => {
             const cached = cache[paciente.id_mediweb];
             const tiempoTranscurrido = cached ? (Date.now() - cached.timestamp) : Infinity;
 
-            // Si está en caché Y han pasado menos de 60 segundos (60000 ms), usamos caché
             if (cached && tiempoTranscurrido < 15000) {
                 return { ...paciente, dni: cached.dni, sexo: cached.sexo, edad: cached.edad };
             }
 
-            // Si es nuevo o su caché caducó, volvemos a extraer
             console.log(`🕵️‍♂️ Escaneando DNI/Sexo/Edad de: ${paciente.nombre} (Nuevo o Caché caducado)`);
-            await new Promise(r => setTimeout(r, index * 250));
+            await new Promise(r => setTimeout(r, index * 250)); // Pequeño retraso para no sobrecargar
             const infoExtra = await extraerDatosConIframe(paciente.url_extraccion);
             guardarEnCache(paciente.id_mediweb, infoExtra);
             return { ...paciente, ...infoExtra };
@@ -218,17 +305,16 @@ async function cicloSincronizacion() {
 
         const pacientesExtraidos = await Promise.all(promesasExtraccion);
 
-        // 3. ANÁLISIS DE PERFILES (DNIs repetidos)
+        // 4. ANÁLISIS DE PERFILES (DNIs repetidos)
         const conteoDNI = {};
         pacientesExtraidos.forEach(p => {
             if (p.dni !== "SIN_DNI") conteoDNI[p.dni] = (conteoDNI[p.dni] || 0) + 1;
         });
 
-        // 4. SMART DIFF (Solo envía si hay cambios)
+        // 5. SMART DIFF (Solo envía si hay cambios)
         const promesasEnvio = pacientesExtraidos.map(async (p) => {
             p.perfiles = conteoDNI[p.dni] || 1;
 
-            // Creamos un string con los datos críticos para comparar
             const datosParaComparar = {
                 pendientes: p.pendientes.join(','),
                 dni: p.dni,
@@ -238,15 +324,14 @@ async function cicloSincronizacion() {
             };
             const hashActual = JSON.stringify(datosParaComparar);
 
-            // Si el estado no ha cambiado respecto a la iteración anterior, NO HACE NADA
             if (estadoAnterior[p.id_mediweb] !== hashActual) {
-                estadoAnterior[p.id_mediweb] = hashActual; // Actualizamos la memoria
-                await enviarASupabase(p); // Disparamos la petición
+                estadoAnterior[p.id_mediweb] = hashActual;
+                await enviarASupabase(p);
             }
         });
         await Promise.all(promesasEnvio);
 
-        // 5. EFECTO ESPEJO (Eliminar borrados)
+        // 6. EFECTO ESPEJO (Eliminar borrados)
         const respGet = await fetch(`${SUPABASE_URL}/rest/v1/turnos_activos?select=id_mediweb`, {
             headers: { 'apikey': SUPABASE_ANON_KEY, 'Authorization': `Bearer ${SUPABASE_ANON_KEY}` }
         });
@@ -255,6 +340,7 @@ async function cicloSincronizacion() {
             const dataSupabase = await respGet.json();
             const idsEnSupabase = dataSupabase.map(r => r.id_mediweb);
 
+            // IMPORTANTE: Ya no elimina si desaparece de la pag 1, sino de TODAS las paginas.
             const paraBorrar = idsEnSupabase.filter(id => !idsEnPantallaFantasma.includes(id));
 
             const promesasBorrado = paraBorrar.map(id => eliminarDeSupabase(id));
@@ -265,12 +351,10 @@ async function cicloSincronizacion() {
 
     } catch (error) {
         console.error("Error en el ciclo:", error);
-        actualizarUI("⚠️ Error de Red", "#FF0000");
+        actualizarUI("⚠️ Error de Red / HTML", "#FF0000");
     }
 
     isSyncing = false;
-
-    // Escaneo profundo automático cada 3 SEGUNDOS
     setTimeout(cicloSincronizacion, 3000);
 }
 
