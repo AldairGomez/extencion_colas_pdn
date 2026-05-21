@@ -102,7 +102,11 @@ async function enviarASupabase(paciente) {
         nombre_paciente: paciente.nombre,
         sexo: paciente.sexo,
         edad: paciente.edad,
-        perfiles: paciente.perfiles,
+        perfiles: paciente.perfiles, // Cantidad de procesos del mismo DNI
+        empresa: paciente.empresa,
+        subcontrata: paciente.subcontrata,
+        perfil_medico: paciente.perfil_medico,
+        tipo_examen: paciente.tipo_examen,
         consultorios_pendientes: especialidadesPostgres,
         estado: "ESPERA"
     };
@@ -252,6 +256,10 @@ async function cicloSincronizacion() {
             for (const fila of filas) {
                 const celdas = fila.querySelectorAll('td');
                 if (celdas.length > 7) {
+                    const empresaExt = celdas[2] ? celdas[2].innerText.trim() : "";
+                    const subcontrataExt = celdas[3] ? celdas[3].innerText.trim() : "";
+                    const perfilMedicoExt = celdas[4] ? celdas[4].innerText.trim() : "";
+                    const tipoExamenExt = celdas[5] ? celdas[5].innerText.trim() : "";
                     const nombreCompleto = celdas[6].innerText.trim();
                     const enlaceHistoria = fila.querySelector('a[href*="idseccion=21"]');
 
@@ -276,6 +284,10 @@ async function cicloSincronizacion() {
                             pacientesAProcesar.push({
                                 id_mediweb: idInterno,
                                 nombre: nombreCompleto,
+                                empresa: empresaExt,
+                                subcontrata: subcontrataExt,
+                                perfil_medico: perfilMedicoExt,
+                                tipo_examen: tipoExamenExt,
                                 url_extraccion: urlObj.href,
                                 pendientes: Array.from(consultoriosPendientes)
                             });
@@ -320,7 +332,11 @@ async function cicloSincronizacion() {
                 dni: p.dni,
                 sexo: p.sexo,
                 edad: p.edad,
-                perfiles: p.perfiles
+                perfiles: p.perfiles,
+                empresa: p.empresa,
+                subcontrata: p.subcontrata,
+                perfil_medico: p.perfil_medico,
+                tipo_examen: p.tipo_examen
             };
             const hashActual = JSON.stringify(datosParaComparar);
 
